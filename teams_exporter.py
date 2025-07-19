@@ -206,6 +206,56 @@ def get_chat_participants(chat_id, token):
     print("🔄 Extracting participants from messages...")
     return extract_participants_from_messages(chat_id, token)
 
+def create_dual_hashes(response, page_number):
+    """
+    Crea hashes duales para diferentes niveles de integridad forense
+    """
+    response_data = response.json()
+    messages = response_data.get('value', [])
+    
+    clean_messages = []
+    for message in messages:
+        clean_message = {
+            'id': message.get('id'),
+            'createdDateTime': message.get('createdDateTime'),
+            'lastModifiedDateTime': message.get('lastModifiedDateTime'),  # ✅ INCLUIR
+            'subject': message.get('subject'),
+            'importance': message.get('importance'),
+            'replyToId': message.get('replyToId')
+        }
+        
+        # Información del remitente
+        from_info = message.get('from')
+        if from_info and 'user' in from_info:
+            user_info = from_info['user']
+            clean_message['from'] = {
+                'displayName': user_info.get('displayName'),
+                'id': user_info.get('id')
+            }
+        
+        # Contenido del mensaje
+        body_info = message.get('body')
+        if body_info:
+            clean_message['body'] = {
+                'content': body_info.get('content'),
+                'contentType': body_info.get('contentType')
+            }
+        
+        clean_messages.append(clean_message)
+    
+    # Hash determinístico incluyendo lastModifiedDateTime
+    messages_data = json.dumps(clean_messages, sort_keys=True, separators=(',', ':'))
+    content_hash = hashlib.sha256(messages_data.encode()).hexdigest()
+    
+    # Hash forense completo
+    forensic_hash = hashlib.sha256(response.content).hexdigest()
+    
+    return {
+        "content_hash": content_hash,
+        "forensic_hash": forensic_hash,
+        "messages_count": len(messages)
+    }
+
 def export_messages(chat_id, token, output_dir="exported_messages"):
     """
     Export: saves all messages in memory and creates final file directly
@@ -270,14 +320,18 @@ def export_messages(chat_id, token, output_dir="exported_messages"):
             response = requests.get(url, headers=headers)
             
             if response.status_code == 200:
-                # Guardar hash de esta página original - CORREGIDO: usar datetime.now(timezone.utc)
+                # Crear hashes duales para esta página
+                dual_hashes = create_dual_hashes(response, page)
+                
+                # Guardar hash de esta página con sistema dual
                 page_hash = {
                     "page": page,
                     "url": url,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "status_code": response.status_code,
-                    "response_hash": hashlib.sha256(response.content).hexdigest(),
-                    "messages_count": len(response.json().get('value', []))
+                    "content_hash": dual_hashes["content_hash"],      # Hash determinístico
+                    "forensic_hash": dual_hashes["forensic_hash"],    # Hash forense completo
+                    "messages_count": dual_hashes["messages_count"]
                 }
                 page_hashes.append(page_hash)
                 
@@ -327,9 +381,13 @@ def export_messages(chat_id, token, output_dir="exported_messages"):
         }
     }
     
-    # Calculate master hash from all page hashes
-    all_hashes_combined = "".join([ph["response_hash"] for ph in page_hashes])
-    chain_of_custody["peritaje_info"]["master_hash"] = hashlib.sha256(all_hashes_combined.encode()).hexdigest()
+    # Calculate master hash from all content hashes (deterministic)
+    all_content_hashes_combined = "".join([ph["content_hash"] for ph in page_hashes])
+    chain_of_custody["peritaje_info"]["master_content_hash"] = hashlib.sha256(all_content_hashes_combined.encode()).hexdigest()
+    
+    # Calculate forensic master hash from all forensic hashes (complete integrity)
+    all_forensic_hashes_combined = "".join([ph["forensic_hash"] for ph in page_hashes])
+    chain_of_custody["peritaje_info"]["master_forensic_hash"] = hashlib.sha256(all_forensic_hashes_combined.encode()).hexdigest()
     
     # Save final file directly (no temporary files)
     if all_messages:
@@ -454,11 +512,21 @@ def select_language():
         
         print("❌ Invalid choice. Please enter 1-4 or en/es/fr/de")
 
-def convert_json_to_pdf(json_file, chain_of_custody, participant_names, language="en", output_file="exported_messages/teams_conversation.pdf"):
+def convert_json_to_pdf(json_file, chain_of_custody, participant_names, language="en", output_file=None):
     """
     Converts Teams JSON to PDF with real chain of custody certificate
     """
     print(f"\n📄 Converting {json_file} to PDF in {language}...")
+    
+    # Generate output filename with timestamp if not provided
+    if output_file is None:
+        # Ensure output directory exists
+        output_dir = "exported_messages"
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+        
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_file = f"{output_dir}/teams_conversation_{timestamp}.pdf"
     
     # Load language configuration
     lang_config = load_language_config()
@@ -496,6 +564,14 @@ def convert_json_to_pdf(json_file, chain_of_custody, participant_names, language
         parent=styles['Normal'],
         fontSize=8,
         fontName='Courier'
+    )
+    
+    # Style for hash explanation (smaller than heading but larger than normal)
+    hash_explanation_style = ParagraphStyle(
+        'HashExplanationStyle',
+        parent=styles['Normal'],
+        fontSize=9,
+        fontName='Helvetica-Bold'
     )
     
     # Document header
@@ -542,20 +618,38 @@ def convert_json_to_pdf(json_file, chain_of_custody, participant_names, language
         story.append(Paragraph(f"Total Pages: {peritaje_info['total_pages']}", metadata_style))
         story.append(Spacer(1, 10))
         
-        # Page hashes
-        story.append(Paragraph("API Response Hashes (by page):", styles['Normal']))
+        # Hash explanation section
+        story.append(Paragraph(texts["hash_explanation"], hash_explanation_style))
+        story.append(Paragraph(texts["content_hash_explanation"], styles['Normal']))
+        story.append(Paragraph(texts["forensic_hash_explanation"], styles['Normal']))
+        story.append(Spacer(1, 10))
+        
+        # Page hashes with dual system
+        story.append(Paragraph("Page Hashes:", styles['Normal']))
         page_hashes = peritaje_info["page_hashes"]
         for page_hash in page_hashes:
             story.append(Paragraph(
-                f"Page {page_hash['page']}: {page_hash['response_hash']}", 
+                f"Page {page_hash['page']}:", 
+                styles['Normal']
+            ))
+            story.append(Paragraph(
+                f"  {texts['content_hash']} {page_hash['content_hash']}", 
                 metadata_style
             ))
+            story.append(Paragraph(
+                f"  {texts['forensic_hash']} {page_hash['forensic_hash']}", 
+                metadata_style
+            ))
+            story.append(Spacer(1, 5))
         
         story.append(Spacer(1, 10))
         
-        # Master hash
-        master_hash = peritaje_info["master_hash"]
-        story.append(Paragraph(f"Master Hash: {master_hash}", metadata_style))
+        # Master hashes
+        master_content_hash = peritaje_info.get("master_content_hash", "N/A")
+        master_forensic_hash = peritaje_info.get("master_forensic_hash", "N/A")
+        
+        story.append(Paragraph(f"Master Content Hash (deterministic): {master_content_hash}", metadata_style))
+        story.append(Paragraph(f"Master Forensic Hash (complete): {master_forensic_hash}", metadata_style))
     
     story.append(Spacer(1, 20))
     
@@ -671,7 +765,7 @@ def main():
     # Step 3: Convert to PDF
     print(f"\n📄 STEP 3: CONVERTING TO PDF")
     print("-" * 30)
-    pdf_file = convert_json_to_pdf(result_file, chain_of_custody, participant_names, language)
+    pdf_file = convert_json_to_pdf(result_file, chain_of_custody, participant_names, language, None)
     
     if not pdf_file:
         print("❌ PDF conversion failed")
@@ -685,7 +779,8 @@ def main():
     print(f"🌍 Language: {language}")
     print(f"📊 Total messages: {len(json.load(open(result_file, 'r', encoding='utf-8')))}")
     print(f"📄 Total pages: {chain_of_custody['peritaje_info']['total_pages'] if chain_of_custody else 'N/A'}")
-    print(f"🔒 Master hash: {chain_of_custody['peritaje_info']['master_hash'] if chain_of_custody else 'N/A'}")
+    print(f"🔒 Master Content Hash (deterministic): {chain_of_custody['peritaje_info'].get('master_content_hash', 'N/A') if chain_of_custody else 'N/A'}")
+    print(f"🔒 Master Forensic Hash (complete): {chain_of_custody['peritaje_info'].get('master_forensic_hash', 'N/A') if chain_of_custody else 'N/A'}")
     print(f"👥 Participants: {', '.join(participant_names) if participant_names else 'N/A'}")
 
 if __name__ == "__main__":
