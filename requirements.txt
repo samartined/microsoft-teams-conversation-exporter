@@ -6,4 +6,4 @@ pillow==11.3.0
 reportlab==4.4.2
 requests==2.32.4
 tqdm==4.67.1
-urllib3==2.5.0
+urllib3==2.6.3
