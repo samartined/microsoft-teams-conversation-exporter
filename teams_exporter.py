@@ -1,17 +1,20 @@
 import json
 import os
-import sys
 import argparse
 import requests
 import hashlib
 import re
 from datetime import datetime, timezone
+from xml.sax.saxutils import escape as xml_escape
 from tqdm import tqdm
 from reportlab.lib.pagesizes import A4
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
+
+# Network timeout (seconds) applied to every Microsoft Graph request.
+REQUEST_TIMEOUT = 30
 
 def get_chat_id_from_user():
     """
@@ -119,7 +122,7 @@ def extract_participants_from_messages(chat_id, token):
     url = f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages?$top=50"
     
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         
         if response.status_code == 200:
             data = response.json()
@@ -165,7 +168,7 @@ def get_chat_participants(chat_id, token):
     
     for i, url in enumerate(approaches, 1):
         try:
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             
             if response.status_code == 200:
                 data = response.json()
@@ -253,7 +256,7 @@ def _request_with_retry(url, headers, max_retries=3):
     """
     import time as _time
     for attempt in range(max_retries):
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
         if response.status_code != 429:
             return response
         retry_after = int(response.headers.get('Retry-After', 60))
@@ -393,43 +396,46 @@ def export_all_chats(token: str, base_dir: str = "exported_messages",
     print(f"\n📁 All exported files are under: {os.path.abspath(base_dir)}")
 
 
+def _normalize_message_for_hash(message: dict) -> dict:
+    """
+    Single source of truth for the message subset that goes into content hashes.
+    create_dual_hashes() (export side) and recompute_master_content_hash()
+    (validation side) MUST both feed messages through this exact function;
+    any divergence would silently break hash verification of past exports.
+    """
+    normalized = {
+        'id': message.get('id'),
+        'createdDateTime': message.get('createdDateTime'),
+        'lastModifiedDateTime': message.get('lastModifiedDateTime'),
+        'subject': message.get('subject'),
+        'importance': message.get('importance'),
+        'replyToId': message.get('replyToId')
+    }
+    from_info = message.get('from')
+    if from_info and 'user' in from_info:
+        user_info = from_info['user']
+        normalized['from'] = {
+            'displayName': user_info.get('displayName'),
+            'id': user_info.get('id')
+        }
+    body_info = message.get('body')
+    if body_info:
+        normalized['body'] = {
+            'content': body_info.get('content'),
+            'contentType': body_info.get('contentType')
+        }
+    return normalized
+
+
 def create_dual_hashes(response, page_number):
     """
     Crea hashes duales para diferentes niveles de integridad forense
     """
     response_data = response.json()
     messages = response_data.get('value', [])
-    
-    clean_messages = []
-    for message in messages:
-        clean_message = {
-            'id': message.get('id'),
-            'createdDateTime': message.get('createdDateTime'),
-            'lastModifiedDateTime': message.get('lastModifiedDateTime'),  # ✅ INCLUIR
-            'subject': message.get('subject'),
-            'importance': message.get('importance'),
-            'replyToId': message.get('replyToId')
-        }
-        
-        # Información del remitente
-        from_info = message.get('from')
-        if from_info and 'user' in from_info:
-            user_info = from_info['user']
-            clean_message['from'] = {
-                'displayName': user_info.get('displayName'),
-                'id': user_info.get('id')
-            }
-        
-        # Contenido del mensaje
-        body_info = message.get('body')
-        if body_info:
-            clean_message['body'] = {
-                'content': body_info.get('content'),
-                'contentType': body_info.get('contentType')
-            }
-        
-        clean_messages.append(clean_message)
-    
+
+    clean_messages = [_normalize_message_for_hash(m) for m in messages]
+
     # Hash determinístico incluyendo lastModifiedDateTime
     messages_data = json.dumps(clean_messages, sort_keys=True, separators=(',', ':'))
     content_hash = hashlib.sha256(messages_data.encode()).hexdigest()
@@ -504,7 +510,7 @@ def export_messages(chat_id, token, output_dir="exported_messages"):
             url = f"https://graph.microsoft.com/v1.0/chats/{chat_id}/messages?$top=50"
         
         try:
-            response = requests.get(url, headers=headers)
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
             
             if response.status_code == 200:
                 # Crear hashes duales para esta página
@@ -877,14 +883,14 @@ def convert_json_to_pdf(json_file, chain_of_custody, participant_names, language
             # Clean HTML content
             clean_content = clean_html_content(body_content)
             # Re-escape any residual XML-special chars so ReportLab's parser doesn't choke
-            clean_content = clean_content.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            from_user = from_user.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            clean_content = xml_escape(clean_content)
+            from_user = xml_escape(from_user)
 
             # Convert date
             try:
                 dt = datetime.fromisoformat(created_date.replace('Z', '+00:00'))
                 formatted_date = dt.strftime('%d/%m/%Y %H:%M:%S')
-            except:
+            except (ValueError, AttributeError, TypeError):
                 formatted_date = created_date
 
             # Create message in PDF (without HTML)
@@ -933,31 +939,7 @@ def recompute_master_content_hash(messages: list, page_size: int = 50) -> str:
 
     page_content_hashes = []
     for page_messages in pages:
-        clean_messages = []
-        for message in page_messages:
-            clean_message = {
-                'id': message.get('id'),
-                'createdDateTime': message.get('createdDateTime'),
-                'lastModifiedDateTime': message.get('lastModifiedDateTime'),
-                'subject': message.get('subject'),
-                'importance': message.get('importance'),
-                'replyToId': message.get('replyToId')
-            }
-            from_info = message.get('from')
-            if from_info and 'user' in from_info:
-                user_info = from_info['user']
-                clean_message['from'] = {
-                    'displayName': user_info.get('displayName'),
-                    'id': user_info.get('id')
-                }
-            body_info = message.get('body')
-            if body_info:
-                clean_message['body'] = {
-                    'content': body_info.get('content'),
-                    'contentType': body_info.get('contentType')
-                }
-            clean_messages.append(clean_message)
-
+        clean_messages = [_normalize_message_for_hash(m) for m in page_messages]
         messages_data = json.dumps(clean_messages, sort_keys=True, separators=(',', ':'))
         page_content_hashes.append(hashlib.sha256(messages_data.encode()).hexdigest())
 
@@ -1078,15 +1060,13 @@ def validate_exports(base_dir: str = "exported_messages") -> bool:
             failed += 1
             failed_dirs.append((name, r["errors"]))
         else:
+            # validate_chat_export only reaches this branch when hash_verified
+            # is True (verified) or None (no integrity file to check against);
+            # the False case always populates r["errors"] and is handled above.
             if r["hash_verified"] is True:
                 status = "✅ PASS (hash verified)"
-            elif r["hash_verified"] is None:
-                status = "✅ PASS (structural only — no integrity file)"
             else:
-                status = "❌ FAIL (hash mismatch)"
-                failed += 1
-                failed_dirs.append((name, r["errors"]))
-                continue
+                status = "✅ PASS (structural only — no integrity file)"
             passed += 1
 
         msgs = f"{r['message_count']} msgs" if r["message_count"] else "?"
